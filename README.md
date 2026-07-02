@@ -1,13 +1,18 @@
 # Postgrext
 
 A rewrite of [PostgREST](https://postgrest.org) in Elixir. Point it at a
-PostgreSQL database and it serves a RESTful API from the schema, speaking
-PostgREST's query syntax: tables and views become endpoints, functions become
-RPC calls, and foreign keys drive resource embedding.
+PostgreSQL — or SQLite — database and it serves a RESTful API from the schema,
+speaking PostgREST's query syntax: tables and views become endpoints,
+functions become RPC calls, and foreign keys drive resource embedding.
 
 Everything is executed as parameterized SQL with identifiers validated against
-an introspected schema cache; Postgres itself renders the JSON response bodies
-(`json_agg` / `to_json`), so all Postgres types serialize correctly.
+an introspected schema cache; the database itself renders the JSON response
+bodies (`json_agg`/`to_json` on Postgres, `json_group_array`/`json_object` on
+SQLite), so types serialize correctly.
+
+Backends are pluggable behind the `Postgrext.Adapter` behaviour: an adapter
+owns its supervision children, introspection, SQL dialect, and transactions,
+and the HTTP layer only sees operation results.
 
 ## Requirements
 
@@ -38,16 +43,35 @@ PostgREST-compatible environment variables:
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `PGRST_DB_URI` | Postgres connection URI (required to serve) | — |
-| `PGRST_DB_SCHEMAS` | Comma-separated schemas to expose; first is the default | `public` |
+| `PGRST_DB_URI` | `postgres://` URI or `sqlite:<path>` / `sqlite::memory:` (required to serve) | — |
+| `PGRST_DB_SCHEMAS` | Comma-separated schemas to expose; first is the default | `public` (Postgres) / `main` (SQLite) |
 | `PGRST_DB_ANON_ROLE` | Role for unauthenticated requests (`set local role`) | connection role |
 | `PGRST_DB_POOL` | Connection pool size | `10` |
 | `PGRST_JWT_SECRET` | HS256 secret; enables `Bearer` JWT auth via the `role` claim | auth disabled |
 | `PGRST_SERVER_PORT` | HTTP port | `3000` |
 
-Every request runs in a transaction with `set_config('role', ...)` and
-`set_config('request.jwt.claims', ...)` applied, so row-level security and
+On Postgres every request runs in a transaction with `set_config('role', ...)`
+and `set_config('request.jwt.claims', ...)` applied, so row-level security and
 `current_setting('request.jwt.claims')` work as they do under PostgREST.
+
+### SQLite backend
+
+    PGRST_DB_URI="sqlite:/path/to/app.db" mix run --no-halt
+
+The full query syntax works — filters, logic trees, embedding (both
+directions, nested), ordering, paging, counts, singular responses, and all
+mutations including `Prefer: return=representation` (implemented by
+re-reading the affected rows by rowid inside the transaction). Booleans are
+rendered as JSON `true`/`false` despite SQLite's 0/1 storage.
+
+SQLite-specific limitations:
+
+- No RPC — SQLite has no stored functions, so `/rpc/*` 404s.
+- No roles or RLS — JWTs are still verified, but the `role` claim is ignored.
+- Unsupported operators (400): `fts`/`plfts`/`phfts`/`wfts`, `match`/`imatch`,
+  and the array/range operators (`cs`, `cd`, `ov`, `sl`, `sr`, `nxr`, `nxl`,
+  `adj`).
+- `WITHOUT ROWID` tables only support `Prefer: return=minimal` mutations.
 
 ## API
 
@@ -100,26 +124,33 @@ db-pre-request, LISTEN/NOTIFY schema reload (use
 ## Architecture
 
 ```
-lib/postgrext/application.ex      supervision tree (pool + cache + Bandit)
-lib/postgrext/config.ex           env → config
+lib/postgrext/application.ex      supervision tree (adapter children + cache + Bandit)
+lib/postgrext/config.ex           env → config, adapter selection
 lib/postgrext/schema_cache.ex     introspection cache (persistent_term)
-lib/postgrext/schema_cache/introspection.ex   pg_catalog queries
-lib/postgrext/request/parser.ex   query string → AST
-lib/postgrext/query/builder.ex    AST → {sql, params}
+lib/postgrext/request/parser.ex   query string → adapter-neutral AST
+lib/postgrext/request/parser/grammar.ex   NimbleParsec grammars
+lib/postgrext/adapter.ex          backend behaviour (the contract)
+lib/postgrext/adapters/postgres.ex          Postgrex pool, transactions, roles
+lib/postgrext/adapters/postgres/builder.ex  PostgreSQL dialect
+lib/postgrext/adapters/postgres/introspection.ex  pg_catalog queries
+lib/postgrext/adapters/sqlite.ex            exqlite backend
+lib/postgrext/adapters/sqlite/builder.ex    SQLite dialect
+lib/postgrext/adapters/sqlite/introspection.ex    sqlite_master + pragmas
 lib/postgrext/auth.ex             JWT → role
 lib/postgrext/router.ex           Plug.Router dispatch
-lib/postgrext/controller.ex       execute + respond
+lib/postgrext/controller.ex       HTTP ↔ adapter operations
 lib/postgrext/error.ex            error mapping
 ```
 
 ## Tests
 
 ```sh
-mix test                        # unit suites, no database needed
+mix test                        # unit suites + SQLite end-to-end (in-memory)
 mix test --include integration  # + end-to-end suite against local Postgres
 ```
 
-The integration suite connects to `PGRST_DB_URI` (default
-`postgres://localhost:5432/postgres`), builds a scratch `postgrext_test`
-schema, exercises the full router/controller/builder stack, and drops the
+The SQLite end-to-end suite runs by default on a `:memory:` database — no
+external service needed. The Postgres integration suite connects to
+`PGRST_DB_URI` (default `postgres://localhost:5432/postgres`), builds a
+scratch `postgrext_test` schema, exercises the full stack, and drops the
 schema afterwards.

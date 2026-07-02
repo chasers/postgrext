@@ -1,7 +1,8 @@
 defmodule Postgrext.SchemaCache do
   @moduledoc """
   Holds the introspected database structure in `:persistent_term` for fast
-  lock-free reads. Loaded at startup; `refresh/0` re-introspects on demand.
+  lock-free reads. Loaded at startup via the configured adapter;
+  `refresh/0` re-introspects on demand.
   """
 
   use GenServer
@@ -25,15 +26,15 @@ defmodule Postgrext.SchemaCache do
 
   @impl GenServer
   def init(opts) do
-    conn = Keyword.get(opts, :conn, Postgrext.DB)
+    adapter = Keyword.get(opts, :adapter, Postgrext.Config.adapter())
     schemas = Keyword.get(opts, :schemas, Postgrext.Config.get(:schemas))
-    put(Postgrext.SchemaCache.Introspection.load(conn, schemas))
-    {:ok, %{conn: conn, schemas: schemas}}
+    put(adapter.introspect(schemas))
+    {:ok, %{adapter: adapter, schemas: schemas}}
   end
 
   @impl GenServer
   def handle_call(:refresh, _from, state) do
-    put(Postgrext.SchemaCache.Introspection.load(state.conn, state.schemas))
+    put(state.adapter.introspect(state.schemas))
     {:reply, :ok, state}
   end
 end

@@ -1,7 +1,7 @@
 defmodule Postgrext.Request.Parser do
   @moduledoc """
-  Parses a PostgREST-style query string into an AST consumed by
-  `Postgrext.Query.Builder`.
+  Parses a PostgREST-style query string into an adapter-neutral AST consumed by
+  the adapter query builders.
 
   Produces a map with:
 

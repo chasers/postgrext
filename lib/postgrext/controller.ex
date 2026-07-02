@@ -1,15 +1,15 @@
 defmodule Postgrext.Controller do
   @moduledoc """
-  Executes parsed requests: resolves auth, builds SQL, runs it inside a
-  transaction with the request role applied via `set_config`, and renders
-  PostgREST-style responses (JSON bodies, `Content-Range`, `Prefer` handling).
+  Translates HTTP requests into adapter operations: resolves auth, parses the
+  query string and payload, dispatches to the configured
+  `Postgrext.Adapter`, and renders PostgREST-style responses (JSON bodies,
+  `Content-Range`, `Prefer` handling).
   """
 
   import Plug.Conn
 
   alias Postgrext.Auth
   alias Postgrext.Error
-  alias Postgrext.Query.Builder
   alias Postgrext.Request.Parser
   alias Postgrext.SchemaCache
 
@@ -20,60 +20,56 @@ defmodule Postgrext.Controller do
     safely(conn, fn ->
       req = request_context(conn)
       ast = Parser.parse(conn.query_string)
-      cache = SchemaCache.get()
 
-      {sql, params} = Builder.read(cache, req.schema, relation, ast, singular: req.singular)
+      result =
+        Postgrext.Config.adapter().read(SchemaCache.get(), req.schema, relation, ast,
+          singular: req.singular,
+          total: req.prefer.count,
+          auth: req.auth
+        )
 
-      count_query =
-        if req.prefer.count == :exact do
-          Builder.count(cache, req.schema, relation, ast)
-        end
-
-      {body, page_count, total} =
-        transact(req, fn conn_pid ->
-          [[body, page_count]] = query!(conn_pid, sql, params).rows
-
-          total =
-            case count_query do
-              nil -> nil
-              {count_sql, count_params} -> hd(hd(query!(conn_pid, count_sql, count_params).rows))
-            end
-
-          {body, page_count, total}
-        end)
-
-      check_singular!(req, page_count)
+      check_singular!(req, result.count)
 
       conn
       |> put_json_content_type(req)
-      |> put_content_range(offset_of(ast), page_count, total)
-      |> send_resp(200, body)
+      |> put_content_range(offset_of(ast), result.count, result.total)
+      |> send_resp(200, result.body)
     end)
   end
 
   @spec create(Plug.Conn.t(), String.t()) :: Plug.Conn.t()
   def create(conn, relation) do
-    mutate(conn, relation, 201, fn cache, req, ast, payload ->
+    mutate(conn, 201, fn req, ast, payload, opts ->
       rows = List.wrap(payload)
       columns = uniform_columns!(rows)
 
-      Builder.insert(cache, req.schema, relation, ast, Jason.encode!(rows), columns,
-        returning: req.prefer.return || :minimal,
-        singular: req.singular
+      Postgrext.Config.adapter().insert(
+        SchemaCache.get(),
+        req.schema,
+        relation,
+        ast,
+        rows,
+        columns,
+        opts
       )
     end)
   end
 
   @spec update(Plug.Conn.t(), String.t()) :: Plug.Conn.t()
   def update(conn, relation) do
-    mutate(conn, relation, 200, fn cache, req, ast, payload ->
+    mutate(conn, 200, fn req, ast, payload, opts ->
       unless is_map(payload) do
         raise Error.parse_error("PATCH requires a JSON object body")
       end
 
-      Builder.update(cache, req.schema, relation, ast, Jason.encode!(payload), Map.keys(payload),
-        returning: req.prefer.return || :minimal,
-        singular: req.singular
+      Postgrext.Config.adapter().update(
+        SchemaCache.get(),
+        req.schema,
+        relation,
+        ast,
+        payload,
+        Map.keys(payload),
+        opts
       )
     end)
   end
@@ -83,18 +79,16 @@ defmodule Postgrext.Controller do
     safely(conn, fn ->
       req = request_context(conn)
       ast = Parser.parse(conn.query_string)
-      cache = SchemaCache.get()
       returning = req.prefer.return || :minimal
 
-      {sql, params} =
-        Builder.delete(cache, req.schema, relation, ast,
+      result =
+        Postgrext.Config.adapter().delete(SchemaCache.get(), req.schema, relation, ast,
           returning: returning,
-          singular: req.singular
+          singular: req.singular,
+          auth: req.auth
         )
 
-      respond_mutation(conn, req, 200, returning, fn conn_pid ->
-        query!(conn_pid, sql, params)
-      end)
+      respond_mutation(conn, req, 200, returning, result)
     end)
   end
 
@@ -111,31 +105,25 @@ defmodule Postgrext.Controller do
       {args, conn} = rpc_args(conn, arg_names)
       ast = Parser.parse(conn.query_string, skip_keys: MapSet.new(Map.keys(args)))
 
-      {sql, params, kind} =
-        Builder.rpc(cache, req.schema, fname, ast, args, singular: req.singular)
-
-      case kind do
+      case Postgrext.Config.adapter().rpc(cache, req.schema, fname, ast, args,
+             singular: req.singular,
+             auth: req.auth
+           ) do
         :void ->
-          transact(req, fn conn_pid -> query!(conn_pid, sql, params) end)
           send_resp(conn, 204, "")
 
-        :scalar ->
-          [[body, _count]] = transact(req, fn conn_pid -> query!(conn_pid, sql, params) end).rows
-
+        {:scalar, body} ->
           conn
           |> put_json_content_type(req)
           |> send_resp(200, body)
 
-        :rows ->
-          [[body, page_count]] =
-            transact(req, fn conn_pid -> query!(conn_pid, sql, params) end).rows
-
-          check_singular!(req, page_count)
+        {:rows, result} ->
+          check_singular!(req, result.count)
 
           conn
           |> put_json_content_type(req)
-          |> put_content_range(offset_of(ast), page_count, nil)
-          |> send_resp(200, body)
+          |> put_content_range(offset_of(ast), result.count, result.total)
+          |> send_resp(200, result.body)
       end
     end)
   end
@@ -169,47 +157,46 @@ defmodule Postgrext.Controller do
     render_error(conn, %Error{status: 404, code: "PGRST404", message: "Not found"})
   end
 
-  defp mutate(conn, _relation, success_status, build) do
+  defp mutate(conn, success_status, operation) do
     safely(conn, fn ->
       req = request_context(conn)
       ast = Parser.parse(conn.query_string)
-      cache = SchemaCache.get()
       {payload, conn} = read_json_body(conn)
+      returning = req.prefer.return || :minimal
 
       if payload == [] do
         conn
         |> put_json_content_type(req)
-        |> send_resp(success_status, if(req.prefer.return == :representation, do: "[]", else: ""))
+        |> send_resp(success_status, if(returning == :representation, do: "[]", else: ""))
       else
-        {sql, params} = build.(cache, req, ast, payload)
-        returning = req.prefer.return || :minimal
+        result =
+          operation.(req, ast, payload,
+            returning: returning,
+            singular: req.singular,
+            auth: req.auth
+          )
 
-        respond_mutation(conn, req, success_status, returning, fn conn_pid ->
-          query!(conn_pid, sql, params)
-        end)
+        respond_mutation(conn, req, success_status, returning, result)
       end
     end)
   end
 
-  defp respond_mutation(conn, req, success_status, returning, run) do
-    result = transact(req, run)
-
+  defp respond_mutation(conn, req, success_status, returning, result) do
     case returning do
       :minimal ->
         status = if success_status == 201, do: 201, else: 204
 
         conn
-        |> put_content_range_mutation(result.num_rows)
+        |> put_content_range_mutation(result.count)
         |> send_resp(status, "")
 
       :representation ->
-        [[body, page_count]] = result.rows
-        check_singular!(req, page_count)
+        check_singular!(req, result.count)
 
         conn
         |> put_json_content_type(req)
-        |> put_content_range_mutation(page_count)
-        |> send_resp(success_status, body)
+        |> put_content_range_mutation(result.count)
+        |> send_resp(success_status, result.body)
     end
   end
 
@@ -223,7 +210,7 @@ defmodule Postgrext.Controller do
   end
 
   defp request_schema(conn) do
-    schemas = Postgrext.Config.get(:schemas) || ["public"]
+    schemas = Postgrext.Config.get(:schemas) || Postgrext.Config.adapter().default_schemas()
 
     requested =
       first_header(conn, "accept-profile") || first_header(conn, "content-profile")
@@ -339,52 +326,22 @@ defmodule Postgrext.Controller do
     end
   end
 
-  defp transact(req, fun) do
-    result =
-      Postgrex.transaction(Postgrext.DB, fn conn_pid ->
-        apply_role(conn_pid, req.auth)
-        fun.(conn_pid)
-      end)
-
-    case result do
-      {:ok, value} ->
-        value
-
-      {:error, :rollback} ->
-        raise %Error{status: 500, code: "PGRST000", message: "transaction rolled back"}
-    end
+  defp check_singular!(%{singular: true}, count) when count != 1 do
+    raise Error.singular_cardinality(count)
   end
 
-  defp apply_role(conn_pid, %{role: nil}), do: {:ok, conn_pid}
-
-  defp apply_role(conn_pid, %{role: role, claims: claims}) do
-    query!(
-      conn_pid,
-      "select set_config('role', $1, true), set_config('request.jwt.claims', $2, true)",
-      [role, Jason.encode!(claims)]
-    )
-  end
-
-  defp query!(conn_pid, sql, params) do
-    Postgrex.query!(conn_pid, sql, params)
-  end
-
-  defp check_singular!(%{singular: true}, page_count) when page_count != 1 do
-    raise Error.singular_cardinality(page_count)
-  end
-
-  defp check_singular!(_req, _page_count), do: :ok
+  defp check_singular!(_req, _count), do: :ok
 
   defp offset_of(ast) do
     Enum.find_value(ast.offset, 0, fn %{path: p, value: v} -> if p == [], do: v end)
   end
 
-  defp put_content_range(conn, offset, page_count, total) do
+  defp put_content_range(conn, offset, count, total) do
     total_part = if total, do: Integer.to_string(total), else: "*"
 
     range =
-      if page_count > 0 do
-        "#{offset}-#{offset + page_count - 1}/#{total_part}"
+      if count > 0 do
+        "#{offset}-#{offset + count - 1}/#{total_part}"
       else
         "*/#{total_part}"
       end

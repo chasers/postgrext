@@ -6,13 +6,21 @@ defmodule Postgrext.Config do
   Recognized variables: `PGRST_DB_URI`, `PGRST_DB_SCHEMAS`,
   `PGRST_DB_ANON_ROLE`, `PGRST_DB_POOL`, `PGRST_JWT_SECRET`,
   `PGRST_SERVER_PORT`.
+
+  A `postgres://` URI selects `Postgrext.Adapters.Postgres`; a
+  `sqlite:<path>` (or `sqlite::memory:`) URI selects
+  `Postgrext.Adapters.SQLite`.
   """
 
   @spec load(%{optional(String.t()) => String.t()}) :: keyword()
   def load(env \\ System.get_env()) do
+    {adapter, db_path} = detect_adapter(env["PGRST_DB_URI"])
+
     [
       db_uri: env["PGRST_DB_URI"],
-      schemas: parse_schemas(env["PGRST_DB_SCHEMAS"]),
+      db_path: db_path,
+      adapter: adapter,
+      schemas: parse_schemas(env["PGRST_DB_SCHEMAS"], adapter.default_schemas()),
       anon_role: env["PGRST_DB_ANON_ROLE"],
       pool_size: parse_int(env["PGRST_DB_POOL"], 10),
       jwt_secret: env["PGRST_JWT_SECRET"],
@@ -22,6 +30,15 @@ defmodule Postgrext.Config do
 
   @spec get(atom()) :: term()
   def get(key), do: Application.get_env(:postgrext, key)
+
+  @spec adapter() :: module()
+  def adapter, do: get(:adapter) || Postgrext.Adapters.Postgres
+
+  defp detect_adapter("sqlite:" <> path) do
+    {Postgrext.Adapters.SQLite, String.replace_prefix(path, "//", "")}
+  end
+
+  defp detect_adapter(_uri), do: {Postgrext.Adapters.Postgres, nil}
 
   @spec put(keyword()) :: :ok
   def put(config) do
@@ -66,15 +83,15 @@ defmodule Postgrext.Config do
     end
   end
 
-  defp parse_schemas(nil), do: ["public"]
+  defp parse_schemas(nil, default), do: default
 
-  defp parse_schemas(value) do
+  defp parse_schemas(value, default) do
     value
     |> String.split(",")
     |> Enum.map(&String.trim/1)
     |> Enum.reject(&(&1 == ""))
     |> case do
-      [] -> ["public"]
+      [] -> default
       schemas -> schemas
     end
   end

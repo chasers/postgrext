@@ -1,7 +1,7 @@
-defmodule Postgrext.Query.BuilderTest do
+defmodule Postgrext.Adapters.Postgres.BuilderTest do
   use ExUnit.Case, async: true
 
-  alias Postgrext.Query.Builder
+  alias Postgrext.Adapters.Postgres.Builder
   alias Postgrext.Request.Parser
 
   defp cache do

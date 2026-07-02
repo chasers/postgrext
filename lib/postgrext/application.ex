@@ -20,14 +20,12 @@ defmodule Postgrext.Application do
       nil ->
         []
 
-      db_uri ->
-        [
-          {Postgrex,
-           [name: Postgrext.DB, pool_size: config[:pool_size]] ++
-             Postgrext.Config.db_opts(db_uri)},
-          Postgrext.SchemaCache,
-          {Bandit, plug: Postgrext.Router, port: config[:port]}
-        ]
+      _db_uri ->
+        config[:adapter].children(config) ++
+          [
+            Postgrext.SchemaCache,
+            {Bandit, plug: Postgrext.Router, port: config[:port]}
+          ]
     end
   end
 end

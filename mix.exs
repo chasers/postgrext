@@ -23,6 +23,7 @@ defmodule Postgrext.MixProject do
       {:bandit, "~> 1.5"},
       {:plug, "~> 1.16"},
       {:postgrex, "~> 0.18"},
+      {:exqlite, "~> 0.27"},
       {:jason, "~> 1.4"},
       {:nimble_parsec, "~> 1.4", runtime: false},
       {:joken, "~> 2.6"},

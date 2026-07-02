@@ -1,4 +1,4 @@
-defmodule Postgrext.Query.Builder do
+defmodule Postgrext.Adapters.Postgres.Builder do
   @moduledoc """
   Turns the parsed AST into parameterized SQL.
 

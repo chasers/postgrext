@@ -62,7 +62,14 @@ defmodule Postgrext.IntegrationTest do
     end
 
     previous_schemas = Postgrext.Config.get(:schemas)
-    Postgrext.Config.put(schemas: [@schema], anon_role: nil, jwt_secret: nil)
+    previous_adapter = Postgrext.Config.get(:adapter)
+
+    Postgrext.Config.put(
+      adapter: Postgrext.Adapters.Postgres,
+      schemas: [@schema],
+      anon_role: nil,
+      jwt_secret: nil
+    )
 
     Postgrex.query!(Postgrext.DB, "drop schema if exists #{@schema} cascade", [])
 
@@ -77,11 +84,13 @@ defmodule Postgrext.IntegrationTest do
         Enum.each(statements, &Postgrex.query!(conn, &1, []))
       end)
 
-    start_supervised!({Postgrext.SchemaCache, conn: Postgrext.DB, schemas: [@schema]})
+    start_supervised!(
+      {Postgrext.SchemaCache, adapter: Postgrext.Adapters.Postgres, schemas: [@schema]}
+    )
 
     on_exit(fn ->
       Postgrex.query!(Postgrext.DB, "drop schema if exists #{@schema} cascade", [])
-      Postgrext.Config.put(schemas: previous_schemas)
+      Postgrext.Config.put(schemas: previous_schemas, adapter: previous_adapter)
     end)
 
     :ok

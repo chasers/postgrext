@@ -1,4 +1,4 @@
-defmodule Postgrext.SchemaCache.Introspection do
+defmodule Postgrext.Adapters.Postgres.Introspection do
   @moduledoc """
   Queries pg_catalog to build the schema cache: relations, columns, primary
   keys, foreign-key relationships (both directions), and callable functions
