@@ -24,6 +24,7 @@ defmodule Postgrext.MixProject do
       {:plug, "~> 1.16"},
       {:postgrex, "~> 0.18"},
       {:jason, "~> 1.4"},
+      {:nimble_parsec, "~> 1.4", runtime: false},
       {:joken, "~> 2.6"},
       {:req, "~> 0.5", only: :test}
     ]

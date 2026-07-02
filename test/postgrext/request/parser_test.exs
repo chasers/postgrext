@@ -3,60 +3,27 @@ defmodule Postgrext.Request.ParserTest do
 
   alias Postgrext.Request.Parser
 
-  describe "select" do
-    test "defaults to all columns" do
-      assert %{select: [%{type: :all}]} = Parser.parse("")
-    end
-
-    test "parses a plain column list" do
-      %{select: select} = Parser.parse("select=id,name")
-
-      assert [
-               %{type: :field, name: "id", alias: nil, casts: []},
-               %{type: :field, name: "name", alias: nil, casts: []}
-             ] = select
-    end
-
-    test "parses star mixed with fields" do
-      %{select: [%{type: :all}, %{type: :field, name: "id"}]} = Parser.parse("select=*,id")
-    end
-
-    test "parses aliases and casts" do
-      %{select: [field]} = Parser.parse("select=fullName:name::text")
-      assert %{name: "name", alias: "fullName", casts: ["text"]} = field
-    end
-
-    test "parses a cast without an alias" do
-      %{select: [field]} = Parser.parse("select=id::text")
-      assert %{name: "id", alias: nil, casts: ["text"]} = field
-    end
-
-    test "parses embedded resources" do
-      %{select: [id, embed]} = Parser.parse("select=id,clients(id,name)")
-
-      assert %{type: :field, name: "id"} = id
-      assert %{type: :embed, name: "clients", alias: nil, hint: nil} = embed
-      assert [%{name: "id"}, %{name: "name"}] = embed.select
-    end
-
-    test "parses nested embeds with aliases and hints" do
-      %{select: [embed]} = Parser.parse("select=who:clients!clients_fk(name,projects(id))")
-
-      assert %{type: :embed, name: "clients", alias: "who", hint: "clients_fk"} = embed
-      assert [%{type: :field, name: "name"}, %{type: :embed, name: "projects"}] = embed.select
-    end
-
-    test "rejects unbalanced parens" do
-      assert_raise Postgrext.Error, ~r/Unclosed embed/, fn ->
-        Parser.parse("select=clients(id")
-      end
-    end
+  test "empty query string yields the default AST" do
+    assert %{select: [%{type: :all}], filters: [], order: [], limit: [], offset: []} =
+             Parser.parse("")
   end
 
-  describe "filters" do
-    test "parses simple operators" do
+  test "select delegates to the select grammar" do
+    %{select: [field, embed]} = Parser.parse("select=id,clients(name)")
+
+    assert %{type: :field, name: "id"} = field
+    assert %{type: :embed, name: "clients", select: [%{name: "name"}]} = embed
+  end
+
+  test "keeps raw params for RPC argument extraction" do
+    assert %{raw_params: [{"a", "1"}, {"select", "name"}]} =
+             Parser.parse("a=1&select=name", skip_keys: MapSet.new(["a"]))
+  end
+
+  describe "filter classification" do
+    test "plain keys become root filters" do
       %{filters: [%{path: [], tree: tree}]} = Parser.parse("age=gte.18")
-      assert %{type: :cond, field: "age", op: "gte", value: "18", negated: false} = tree
+      assert %{type: :cond, field: "age", op: "gte", value: "18"} = tree
     end
 
     test "keeps repeated filters on the same column" do
@@ -64,96 +31,44 @@ defmodule Postgrext.Request.ParserTest do
       assert [%{tree: %{op: "gte"}}, %{tree: %{op: "lt"}}] = filters
     end
 
-    test "parses negation" do
-      %{filters: [%{tree: tree}]} = Parser.parse("age=not.eq.18")
-      assert %{op: "eq", negated: true} = tree
-    end
-
-    test "parses values containing dots" do
-      %{filters: [%{tree: tree}]} = Parser.parse("price=gt.1.5")
-      assert %{op: "gt", value: "1.5"} = tree
-    end
-
-    test "parses in lists with quoted values" do
-      %{filters: [%{tree: tree}]} = Parser.parse(~S|name=in.(alice,"b,ob",carol)|)
-      assert %{op: "in", value: ["alice", "b,ob", "carol"]} = tree
-    end
-
-    test "parses is" do
-      %{filters: [%{tree: tree}]} = Parser.parse("done=is.null")
-      assert %{op: "is", value: "null"} = tree
-    end
-
-    test "rejects invalid is values" do
-      assert_raise Postgrext.Error, ~r/`is` operator/, fn ->
-        Parser.parse("done=is.banana")
-      end
-    end
-
-    test "parses full text search with language" do
-      %{filters: [%{tree: tree}]} = Parser.parse("body=fts(english).cat")
-      assert %{op: "fts", lang: "english", value: "cat"} = tree
-    end
-
-    test "scopes filters to embed paths" do
+    test "dotted keys scope filters to embed paths" do
       %{filters: [%{path: ["clients"], tree: %{field: "name", op: "eq"}}]} =
         Parser.parse("clients.name=eq.acme")
     end
 
-    test "rejects unknown operators" do
-      assert_raise Postgrext.Error, ~r/Unknown filter operator/, fn ->
-        Parser.parse("age=around.18")
-      end
-    end
-
-    test "skips keys in skip_keys" do
+    test "skip_keys removes params from filter parsing" do
       ast = Parser.parse("a=1&age=gte.18", skip_keys: MapSet.new(["a"]))
       assert [%{tree: %{field: "age"}}] = ast.filters
     end
+
+    test "ignores reserved passthrough keys" do
+      assert %{filters: []} = Parser.parse("columns=a,b&on_conflict=id")
+    end
   end
 
-  describe "logic trees" do
-    test "parses or" do
+  describe "logic classification" do
+    test "or becomes a root logic tree" do
       %{filters: [%{path: [], tree: tree}]} = Parser.parse("or=(age.gte.18,age.lt.5)")
-
-      assert %{type: :logic, op: :or, negated: false} = tree
-      assert [%{field: "age", op: "gte"}, %{field: "age", op: "lt"}] = tree.children
+      assert %{type: :logic, op: :or, negated: false, children: [_one, _two]} = tree
     end
 
-    test "parses nested and negated logic" do
-      %{filters: [%{tree: tree}]} =
-        Parser.parse("and=(done.is.true,not.or(age.eq.1,age.eq.2))")
-
-      assert %{op: :and, children: [%{type: :cond}, nested]} = tree
-      assert %{type: :logic, op: :or, negated: true, children: [_one, _two]} = nested
+    test "not.and becomes a negated logic tree" do
+      %{filters: [%{path: [], tree: tree}]} = Parser.parse("not.and=(a.eq.1,b.eq.2)")
+      assert %{type: :logic, op: :and, negated: true} = tree
     end
 
-    test "parses negated conditions inside logic" do
-      %{filters: [%{tree: %{children: [child]}}]} = Parser.parse("and=(age.not.eq.1)")
-      assert %{field: "age", op: "eq", negated: true} = child
-    end
-
-    test "parses in inside logic" do
-      %{filters: [%{tree: %{children: [child]}}]} = Parser.parse("or=(id.in.(1,2,3))")
-      assert %{op: "in", value: ["1", "2", "3"]} = child
-    end
-
-    test "scopes logic to embed paths" do
-      %{filters: [%{path: ["clients"], tree: %{type: :logic}}]} =
+    test "dotted prefixes scope logic to embed paths" do
+      %{filters: [%{path: ["clients"], tree: %{type: :logic, op: :or, negated: false}}]} =
         Parser.parse("clients.or=(id.eq.1,id.eq.2)")
-    end
 
-    test "rejects logic without parens" do
-      assert_raise Postgrext.Error, ~r/parenthesized/, fn ->
-        Parser.parse("or=age.gte.18")
-      end
+      %{filters: [%{path: ["clients"], tree: %{type: :logic, op: :or, negated: true}}]} =
+        Parser.parse("clients.not.or=(id.eq.1,id.eq.2)")
     end
   end
 
   describe "order, limit, offset" do
     test "parses order terms" do
-      %{order: [%{path: [], terms: terms}]} =
-        Parser.parse("order=age.desc.nullslast,name")
+      %{order: [%{path: [], terms: terms}]} = Parser.parse("order=age.desc.nullslast,name")
 
       assert [
                %{field: "age", dir: :desc, nulls: :last},
