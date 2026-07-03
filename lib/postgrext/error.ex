@@ -68,6 +68,15 @@ defmodule Postgrext.Error do
     }
   end
 
+  @spec rls_violation(String.t()) :: t()
+  def rls_violation(relation) do
+    %__MODULE__{
+      status: 403,
+      code: "42501",
+      message: "new row violates row-level security policy for table \"#{relation}\""
+    }
+  end
+
   @spec jwt_error(String.t()) :: t()
   def jwt_error(message) do
     %__MODULE__{status: 401, code: "PGRST301", message: message}

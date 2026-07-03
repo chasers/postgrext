@@ -4,12 +4,31 @@ defmodule Postgrext.Adapters.SQLite.Connection do
   process. Transactions run inside the server, so a transaction body executes
   its queries directly against the handle without interleaving with other
   callers. SQLite errors are normalized into `Postgrext.Error`.
+
+  Opening a database bootstraps the internal RLS tables
+  (`postgrext_rls_enabled`, `postgrext_policies`) if they don't exist yet.
   """
 
   use GenServer
 
   alias Exqlite.Sqlite3
   alias Postgrext.Error
+
+  @bootstrap [
+    "create table if not exists postgrext_rls_enabled (table_name text primary key)",
+    """
+    create table if not exists postgrext_policies (
+      table_name text not null,
+      name text not null,
+      command text not null default 'ALL',
+      kind text not null default 'PERMISSIVE',
+      roles text,
+      using_expr text,
+      check_expr text,
+      primary key (table_name, name)
+    )
+    """
+  ]
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
@@ -47,6 +66,7 @@ defmodule Postgrext.Adapters.SQLite.Connection do
   def init(opts) do
     {:ok, db} = Sqlite3.open(Keyword.fetch!(opts, :database))
     :ok = Sqlite3.execute(db, "pragma foreign_keys = on")
+    Enum.each(@bootstrap, &(:ok = Sqlite3.execute(db, &1)))
     {:ok, %{db: db}}
   end
 

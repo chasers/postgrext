@@ -5,18 +5,26 @@ defmodule Postgrext.Adapters.SQLite.Introspection do
   SQLite has no stored functions, so the function cache is always empty.
   FK constraints have no names in SQLite, so hints match synthesized
   `<table>_<column>_fkey` names or column names.
+
+  Row-level security state is read from the internal `postgrext_rls_enabled`
+  and `postgrext_policies` tables into the cache; those two tables are never
+  exposed as API relations.
   """
 
   alias Postgrext.Adapters.SQLite.Connection
 
   @schema "main"
+  @internal_tables ["postgrext_rls_enabled", "postgrext_policies"]
 
   @spec load([String.t()]) :: map()
   def load(_schemas) do
+    placeholders = Enum.map_join(@internal_tables, ", ", fn _name -> "?" end)
+
     relations =
       Connection.query!(
-        "select name, type from sqlite_master where type in ('table','view') and name not like 'sqlite_%'",
-        []
+        "select name, type from sqlite_master where type in ('table','view') " <>
+          "and name not like 'sqlite_%' and name not in (#{placeholders})",
+        @internal_tables
       ).rows
 
     tables = Map.new(relations, fn [name, type] -> {{@schema, name}, table(name, type)} end)
@@ -24,8 +32,47 @@ defmodule Postgrext.Adapters.SQLite.Introspection do
     %{
       tables: tables,
       relationships: relationships(tables),
-      functions: %{}
+      functions: %{},
+      rls_enabled: rls_enabled(),
+      policies: policies()
     }
+  end
+
+  defp rls_enabled do
+    Connection.query!("select table_name from postgrext_rls_enabled", []).rows
+    |> MapSet.new(fn [name] -> {@schema, name} end)
+  end
+
+  defp policies do
+    Connection.query!(
+      "select table_name, name, command, kind, roles, using_expr, check_expr from postgrext_policies",
+      []
+    ).rows
+    |> Enum.group_by(fn [table | _rest] -> {@schema, table} end, &policy/1)
+  end
+
+  defp policy([_table, name, command, kind, roles, using_expr, check_expr]) do
+    %{
+      name: name,
+      command: String.upcase(command || "ALL"),
+      kind: policy_kind(kind),
+      roles: policy_roles(roles),
+      using: using_expr,
+      check: check_expr
+    }
+  end
+
+  defp policy_kind(kind) do
+    if String.upcase(kind || "PERMISSIVE") == "RESTRICTIVE", do: :restrictive, else: :permissive
+  end
+
+  defp policy_roles(nil), do: nil
+
+  defp policy_roles(roles) do
+    case Jason.decode(roles) do
+      {:ok, list} when is_list(list) -> Enum.map(list, &to_string/1)
+      _other -> []
+    end
   end
 
   defp table(name, type) do

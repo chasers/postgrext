@@ -12,8 +12,15 @@ defmodule Postgrext.Adapters.SQLite.Builder do
 
   Boolean-declared columns are rendered as JSON `true`/`false` rather than
   SQLite's 0/1 storage form.
+
+  Row-level security visibility conditions from
+  `Postgrext.Adapters.SQLite.Policies` are appended to the `where` clause of
+  reads (root and embedded tables alike), counts, updates, and deletes when
+  the target table has RLS enabled; `opts[:auth]` supplies the request auth
+  context.
   """
 
+  alias Postgrext.Adapters.SQLite.Policies
   alias Postgrext.Error
 
   @operators %{
@@ -32,17 +39,14 @@ defmodule Postgrext.Adapters.SQLite.Builder do
   def read(cache, schema, relation, ast, opts \\ []) do
     table = fetch_table!(cache, schema, relation)
 
-    extra =
+    extras =
       case Keyword.get(opts, :rowids) do
         nil -> []
         rowids -> [rowid_condition(relation, rowids)]
       end
 
-    {extra_conditions, params} =
-      Enum.map_reduce(extra, [], fn {sql, values}, params -> {sql, params ++ values} end)
-
     {inner, params} =
-      row_query(cache, table, relation, root_context(ast), params, extra_conditions)
+      row_query(cache, table, relation, root_context(ast, Keyword.get(opts, :auth)), [], extras)
 
     body =
       if Keyword.get(opts, :singular, false) do
@@ -54,10 +58,11 @@ defmodule Postgrext.Adapters.SQLite.Builder do
     {"select #{body}, count(*) from (#{inner}) as _body", params}
   end
 
-  @spec count(map(), String.t(), String.t(), map()) :: {String.t(), [term()]}
-  def count(cache, schema, relation, ast) do
+  @spec count(map(), String.t(), String.t(), map(), keyword()) :: {String.t(), [term()]}
+  def count(cache, schema, relation, ast, opts \\ []) do
     table = fetch_table!(cache, schema, relation)
-    {where_sql, params} = build_where(cache, table, relation, ast.filters, [], [])
+    extras = visibility_extras(cache, Keyword.get(opts, :auth), table, "SELECT")
+    {where_sql, params} = build_where(cache, table, relation, ast.filters, extras, [])
 
     {"select count(*) from #{quote_ident(relation)} as #{quote_ident(relation)}#{where_sql}",
      params}
@@ -87,17 +92,19 @@ defmodule Postgrext.Adapters.SQLite.Builder do
 
     sets = Enum.map_join(columns, ", ", &"#{quote_ident(&1)} = json_extract(?, #{json_path(&1)})")
     set_params = List.duplicate(payload_json, length(columns))
+    extras = visibility_extras(cache, Keyword.get(opts, :auth), table, "UPDATE")
 
-    {where_sql, params} = build_where(cache, table, relation, filters, [], set_params)
+    {where_sql, params} = build_where(cache, table, relation, filters, extras, set_params)
     {"update #{quote_ident(relation)} set #{sets}#{where_sql}" <> returning(opts), params}
   end
 
-  @spec delete(map(), String.t(), String.t(), map()) :: {String.t(), [term()]}
-  def delete(cache, schema, relation, ast) do
+  @spec delete(map(), String.t(), String.t(), map(), keyword()) :: {String.t(), [term()]}
+  def delete(cache, schema, relation, ast, opts \\ []) do
     table = fetch_table!(cache, schema, relation)
     filters = require_filters!(ast, "DELETE")
+    extras = visibility_extras(cache, Keyword.get(opts, :auth), table, "DELETE")
 
-    {where_sql, params} = build_where(cache, table, relation, filters, [], [])
+    {where_sql, params} = build_where(cache, table, relation, filters, extras, [])
     {"delete from #{quote_ident(relation)}#{where_sql}", params}
   end
 
@@ -112,13 +119,14 @@ defmodule Postgrext.Adapters.SQLite.Builder do
     {"#{quote_ident(relation)}.\"rowid\" in (#{placeholders})", rowids}
   end
 
-  defp root_context(ast) do
+  defp root_context(ast, auth) do
     %{
       select: ast.select,
       filters: ast.filters,
       order: ast.order,
       limit: ast.limit,
-      offset: ast.offset
+      offset: ast.offset,
+      auth: auth
     }
   end
 
@@ -132,11 +140,12 @@ defmodule Postgrext.Adapters.SQLite.Builder do
     ast.filters
   end
 
-  defp row_query(cache, table, alias_name, ctx, params, extra_conditions) do
+  defp row_query(cache, table, alias_name, ctx, params, extras) do
+    extras = extras ++ visibility_extras(cache, ctx.auth, table, "SELECT")
     {json_expr, params} = row_json(cache, table, alias_name, ctx, params)
 
     {where_sql, params} =
-      build_where(cache, table, alias_name, ctx.filters, extra_conditions, params)
+      build_where(cache, table, alias_name, ctx.filters, extras, params)
 
     order_sql = build_order(cache, table, alias_name, ctx.order)
     {limit_sql, offset_sql} = limit_offset_sql(ctx)
@@ -206,7 +215,8 @@ defmodule Postgrext.Adapters.SQLite.Builder do
     join_conditions =
       Enum.zip(rel.cols, rel.foreign_cols)
       |> Enum.map(fn {mine, theirs} ->
-        "#{quote_ident(child_alias)}.#{quote_ident(theirs)} = #{quote_ident(alias_name)}.#{quote_ident(mine)}"
+        {"#{quote_ident(child_alias)}.#{quote_ident(theirs)} = #{quote_ident(alias_name)}.#{quote_ident(mine)}",
+         []}
       end)
 
     child_ctx = %{
@@ -214,15 +224,17 @@ defmodule Postgrext.Adapters.SQLite.Builder do
       filters: scoped(ctx.filters, embed),
       order: scoped(ctx.order, embed),
       limit: scoped(ctx.limit, embed),
-      offset: scoped(ctx.offset, embed)
+      offset: scoped(ctx.offset, embed),
+      auth: ctx.auth
     }
 
     case rel.cardinality do
       :m2o ->
+        extras = join_conditions ++ visibility_extras(cache, ctx.auth, child_table, "SELECT")
         {json_expr, params} = row_json(cache, child_table, child_alias, child_ctx, params)
 
         {where_sql, params} =
-          build_where(cache, child_table, child_alias, child_ctx.filters, join_conditions, params)
+          build_where(cache, child_table, child_alias, child_ctx.filters, extras, params)
 
         sql =
           "json((select #{json_expr} from #{quote_ident(child_table.name)} as #{quote_ident(child_alias)}" <>
@@ -247,17 +259,27 @@ defmodule Postgrext.Adapters.SQLite.Builder do
     |> Enum.map(fn entry -> %{entry | path: tl(entry.path)} end)
   end
 
-  defp build_where(cache, table, alias_name, filters, extra_conditions, params) do
+  defp build_where(cache, table, alias_name, filters, extras, params) do
     trees = for %{path: [], tree: tree} <- filters, do: tree
+
+    {extra_frags, params} =
+      Enum.map_reduce(extras, params, fn {sql, values}, params -> {sql, params ++ values} end)
 
     {condition_frags, params} =
       Enum.map_reduce(trees, params, fn tree, params ->
         condition_sql(cache, table, alias_name, tree, params)
       end)
 
-    case extra_conditions ++ condition_frags do
+    case extra_frags ++ condition_frags do
       [] -> {"", params}
       conditions -> {" where " <> Enum.join(conditions, " and "), params}
+    end
+  end
+
+  defp visibility_extras(cache, auth, table, command) do
+    case Policies.visibility(cache, auth, table, command) do
+      nil -> []
+      condition -> [condition]
     end
   end
 

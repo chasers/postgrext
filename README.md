@@ -67,11 +67,52 @@ rendered as JSON `true`/`false` despite SQLite's 0/1 storage.
 SQLite-specific limitations:
 
 - No RPC — SQLite has no stored functions, so `/rpc/*` 404s.
-- No roles or RLS — JWTs are still verified, but the `role` claim is ignored.
+- No database roles or grants — the JWT `role` claim only selects which RLS
+  policies apply.
 - Unsupported operators (400): `fts`/`plfts`/`phfts`/`wfts`, `match`/`imatch`,
   and the array/range operators (`cs`, `cd`, `ov`, `sl`, `sr`, `nxr`, `nxl`,
   `adj`).
-- `WITHOUT ROWID` tables only support `Prefer: return=minimal` mutations.
+- `WITHOUT ROWID` tables only support `Prefer: return=minimal` mutations, and
+  RLS `WITH CHECK` enforcement (which re-reads by rowid) doesn't work on them.
+
+#### Row-level security on SQLite
+
+SQLite has no native RLS, so policies are modeled as rows in two internal
+tables that Postgrext creates in the database on first open (they are never
+exposed as API endpoints):
+
+```sql
+-- ALTER TABLE <t> ENABLE ROW LEVEL SECURITY
+insert into postgrext_rls_enabled (table_name) values ('notes');
+
+-- CREATE POLICY <name> ON <t> [AS kind] [FOR command] [TO roles]
+--   [USING (expr)] [WITH CHECK (expr)]
+insert into postgrext_policies
+  (table_name, name, command, kind, roles, using_expr, check_expr)
+values
+  ('notes', 'own_notes', 'ALL', 'PERMISSIVE', '["authenticated"]',
+   'owner = auth.uid()', null);
+```
+
+Columns map 1:1 onto Postgres `CREATE POLICY` clauses, so a SQLite database
+upgrades to native Postgres policies mechanically. `command` is
+`ALL|SELECT|INSERT|UPDATE|DELETE`, `kind` is `PERMISSIVE|RESTRICTIVE`, and
+`roles` is a JSON array of role names (null = all roles, like `TO public`).
+
+`using_expr` / `check_expr` are SQL boolean expressions over the table's
+columns. The request auth context is available as `auth.role()` (the request
+role), `auth.uid()` (the JWT `sub` claim), and `auth.jwt()` (the claims as
+JSON text — combine with `->>`); on SQLite these are bound as parameters, on
+Postgres they resolve to the standard Supabase `auth.*` helper functions.
+
+Semantics follow Postgres: with RLS enabled and no applicable policy the
+table is inaccessible; permissive policies OR together and restrictive
+policies AND on top; `USING` filters reads (including embedded tables,
+counts, and representation re-reads), updates, and deletes; `WITH CHECK`
+(falling back to `USING`) is enforced on inserted/updated rows inside the
+transaction — violations roll back with `403` / code `42501`. Policy changes
+take effect after `Postgrext.SchemaCache.refresh/0` (policies load with the
+schema cache).
 
 ## API
 
@@ -135,6 +176,7 @@ lib/postgrext/adapters/postgres/builder.ex  PostgreSQL dialect
 lib/postgrext/adapters/postgres/introspection.ex  pg_catalog queries
 lib/postgrext/adapters/sqlite.ex            exqlite backend
 lib/postgrext/adapters/sqlite/builder.ex    SQLite dialect
+lib/postgrext/adapters/sqlite/policies.ex   emulated row-level security
 lib/postgrext/adapters/sqlite/introspection.ex    sqlite_master + pragmas
 lib/postgrext/auth.ex             JWT → role
 lib/postgrext/router.ex           Plug.Router dispatch
